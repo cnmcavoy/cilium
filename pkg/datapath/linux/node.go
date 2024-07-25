@@ -882,12 +882,14 @@ func (n *linuxNodeHandler) insertNeighbor(ctx context.Context, newNode *nodeType
 	var errs error
 	if newNode.GetNodeIP(false).To4() != nil {
 		for _, l := range links {
-			errs = errors.Join(errs, n.insertNeighbor4(ctx, newNode, l, refresh))
+			_ = n.insertNeighbor4(ctx, newNode, l, refresh)
+			//errs = errors.Join(errs, n.insertNeighbor4(ctx, newNode, l, refresh))
 		}
 	}
 	if newNode.GetNodeIP(true).To16() != nil {
 		for _, l := range links {
-			errs = errors.Join(errs, n.insertNeighbor6(ctx, newNode, l, refresh))
+			_ = n.insertNeighbor6(ctx, newNode, l, refresh)
+			//errs = errors.Join(errs, n.insertNeighbor6(ctx, newNode, l, refresh))
 		}
 	}
 
