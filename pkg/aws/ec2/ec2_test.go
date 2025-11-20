@@ -11,6 +11,9 @@ import (
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	ec2_types "github.com/aws/aws-sdk-go-v2/service/ec2/types"
+
+	"github.com/cilium/cilium/pkg/cidr"
+	ipamTypes "github.com/cilium/cilium/pkg/ipam/types"
 )
 
 type Filters []ec2_types.Filter
@@ -146,4 +149,134 @@ func TestNewTagsFilters(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestFilterVPCCIDRsBySubnets(t *testing.T) {
+	tests := []struct {
+		name        string
+		vpcCIDRs    []string
+		primaryCIDR string
+		subnets     map[string]*ipamTypes.Subnet
+		vpcID       string
+		want        []string
+	}{
+		{
+			name:        "empty subnets returns all CIDRs",
+			vpcCIDRs:    []string{"10.0.0.0/16", "10.1.0.0/16"},
+			primaryCIDR: "10.0.0.0/16",
+			subnets:     ipamTypes.SubnetMap{},
+			vpcID:       "vpc-1",
+			want:        []string{"10.0.0.0/16", "10.1.0.0/16"},
+		},
+		{
+			name:        "filters CIDRs to only those in available subnets",
+			vpcCIDRs:    []string{"10.0.0.0/16", "10.1.0.0/16", "10.2.0.0/16"},
+			primaryCIDR: "10.0.0.0/16",
+			subnets: ipamTypes.SubnetMap{
+				"subnet-1": {
+					ID:                 "subnet-1",
+					VirtualNetworkID:   "vpc-1",
+					CIDR:               mustParseCIDR("10.0.0.0/24"),
+					AvailabilityZone:   "us-east-1a",
+					AvailableAddresses: 100,
+				},
+				"subnet-2": {
+					ID:                 "subnet-2",
+					VirtualNetworkID:   "vpc-1",
+					CIDR:               mustParseCIDR("10.1.0.0/24"),
+					AvailabilityZone:   "us-east-1b",
+					AvailableAddresses: 200,
+				},
+			},
+			vpcID: "vpc-1",
+			want:  []string{"10.0.0.0/16", "10.1.0.0/16"},
+		},
+		{
+			name:        "always includes primary CIDR even if not in subnets",
+			vpcCIDRs:    []string{"10.0.0.0/16", "10.1.0.0/16"},
+			primaryCIDR: "10.0.0.0/16",
+			subnets: ipamTypes.SubnetMap{
+				"subnet-1": {
+					ID:                 "subnet-1",
+					VirtualNetworkID:   "vpc-1",
+					CIDR:               mustParseCIDR("10.1.0.0/24"),
+					AvailabilityZone:   "us-east-1a",
+					AvailableAddresses: 100,
+				},
+			},
+			vpcID: "vpc-1",
+			want:  []string{"10.0.0.0/16", "10.1.0.0/16"},
+		},
+		{
+			name:        "filters out CIDRs from different VPC",
+			vpcCIDRs:    []string{"10.0.0.0/16", "10.1.0.0/16"},
+			primaryCIDR: "10.0.0.0/16",
+			subnets: ipamTypes.SubnetMap{
+				"subnet-1": {
+					ID:                 "subnet-1",
+					VirtualNetworkID:   "vpc-2",
+					CIDR:               mustParseCIDR("10.1.0.0/24"),
+					AvailabilityZone:   "us-east-1a",
+					AvailableAddresses: 100,
+				},
+			},
+			vpcID: "vpc-1",
+			want:  []string{"10.0.0.0/16"},
+		},
+		{
+			name:        "handles subnets without CIDR",
+			vpcCIDRs:    []string{"10.0.0.0/16", "10.1.0.0/16"},
+			primaryCIDR: "10.0.0.0/16",
+			subnets: ipamTypes.SubnetMap{
+				"subnet-1": {
+					ID:                 "subnet-1",
+					VirtualNetworkID:   "vpc-1",
+					CIDR:               nil,
+					AvailabilityZone:   "us-east-1a",
+					AvailableAddresses: 100,
+				},
+			},
+			vpcID: "vpc-1",
+			want:  []string{"10.0.0.0/16"},
+		},
+		{
+			name:        "returns only CIDRs present in subnets when primary is also in subnet",
+			vpcCIDRs:    []string{"10.0.0.0/16", "10.1.0.0/16", "10.2.0.0/16"},
+			primaryCIDR: "10.0.0.0/16",
+			subnets: ipamTypes.SubnetMap{
+				"subnet-1": {
+					ID:                 "subnet-1",
+					VirtualNetworkID:   "vpc-1",
+					CIDR:               mustParseCIDR("10.0.0.0/24"),
+					AvailabilityZone:   "us-east-1a",
+					AvailableAddresses: 100,
+				},
+			},
+			vpcID: "vpc-1",
+			want:  []string{"10.0.0.0/16"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := filterVPCCIDRsBySubnets(tt.vpcCIDRs, tt.primaryCIDR, tt.subnets, tt.vpcID)
+
+			// Sort for consistent comparison
+			sort.Strings(got)
+			sort.Strings(tt.want)
+
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Errorf("filterVPCCIDRsBySubnets() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// mustParseCIDR is a helper function for tests
+func mustParseCIDR(s string) *cidr.CIDR {
+	c, err := cidr.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return c
 }

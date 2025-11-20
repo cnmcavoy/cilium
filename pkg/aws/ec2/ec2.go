@@ -357,6 +357,63 @@ func (c *Client) describeNetworkInterfacesFromInstances(ctx context.Context) ([]
 	return result, nil
 }
 
+// filterVPCCIDRsBySubnets filters VPC CIDRs to only include those that are
+// present in the available subnets. This ensures that CiliumNode status only
+// reflects CIDRs from subnets that match the configured filters and are actually
+// usable by Cilium.
+func filterVPCCIDRsBySubnets(vpcCIDRs []string, primaryCIDR string, subnets ipamTypes.SubnetMap, vpcID string) []string {
+	if len(subnets) == 0 {
+		// If no subnet information is available, return all VPC CIDRs as fallback
+		return vpcCIDRs
+	}
+
+	// Parse VPC CIDRs into CIDR objects for comparison
+	parsedVPCCIDRs := make([]*cidr.CIDR, 0, len(vpcCIDRs))
+	vpcCIDRStrings := make(map[string]string) // Map parsed CIDR back to original string
+	for _, cidrStr := range vpcCIDRs {
+		c, err := cidr.ParseCIDR(cidrStr)
+		if err == nil {
+			parsedVPCCIDRs = append(parsedVPCCIDRs, c)
+			vpcCIDRStrings[c.String()] = cidrStr
+		}
+	}
+
+	// Always include the primary CIDR if it's set
+	includedCIDRs := make(map[string]bool)
+	if primaryCIDR != "" {
+		includedCIDRs[primaryCIDR] = true
+	}
+
+	// Check each subnet's CIDR against VPC CIDRs to see which VPC CIDRs contain subnets
+	for _, subnet := range subnets {
+		if subnet.VirtualNetworkID != vpcID || subnet.CIDR == nil {
+			continue
+		}
+
+		// Check if this subnet's CIDR falls within any VPC CIDR
+		for _, vpcCIDR := range parsedVPCCIDRs {
+			if vpcCIDR.Contains(subnet.CIDR.IP) {
+				// This VPC CIDR contains at least one available subnet
+				if originalStr, ok := vpcCIDRStrings[vpcCIDR.String()]; ok {
+					includedCIDRs[originalStr] = true
+				} else {
+					includedCIDRs[vpcCIDR.String()] = true
+				}
+			}
+		}
+	}
+
+	// Build filtered list maintaining original order
+	filtered := []string{}
+	for _, cidr := range vpcCIDRs {
+		if includedCIDRs[cidr] {
+			filtered = append(filtered, cidr)
+		}
+	}
+
+	return filtered
+}
+
 // parseENI parses a ec2.NetworkInterface as returned by the EC2 service API,
 // converts it into a eniTypes.ENI object
 func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMap, subnets ipamTypes.SubnetMap, usePrimary bool) (instanceID string, eni *eniTypes.ENI, err error) {
@@ -407,7 +464,12 @@ func parseENI(iface *ec2_types.NetworkInterface, vpcs ipamTypes.VirtualNetworkMa
 		if vpcs != nil {
 			if vpc, ok := vpcs[eni.VPC.ID]; ok {
 				eni.VPC.PrimaryCIDR = vpc.PrimaryCIDR
-				eni.VPC.CIDRs = vpc.CIDRs
+
+				// Filter VPC CIDRs to only include those from available subnets.
+				// This ensures that when subnet tags change or subnets are removed,
+				// the CiliumNode status will reflect only the CIDRs that Cilium can
+				// actually use, triggering automatic reconciliation of pod routing rules.
+				eni.VPC.CIDRs = filterVPCCIDRsBySubnets(vpc.CIDRs, vpc.PrimaryCIDR, subnets, eni.VPC.ID)
 			}
 		}
 	}
