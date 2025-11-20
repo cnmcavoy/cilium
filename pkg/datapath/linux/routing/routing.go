@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
 
 	"github.com/sirupsen/logrus"
 	"github.com/vishvananda/netlink"
@@ -90,11 +91,19 @@ func (info *RoutingInfo) Configure(ip net.IP, mtu int, compat bool, host bool) e
 
 	// The condition here should mirror the condition in Delete.
 	if info.Masquerade && info.IpamMode == ipamOption.IPAMENI {
+
 		// Lookup a VPC specific table for all traffic from an endpoint to the
 		// CIDR configured for the VPC on which the endpoint has the IP on.
 		// ReplaceRule function doesn't handle all zeros cidr and return `file exists` error,
 		// so we need to normalize the rule to cidr here and in Delete
 		for _, cidr := range info.IPv4CIDRs {
+			log.WithFields(logrus.Fields{
+				"endpointIP":     ip,
+				"cidr":           cidr.String(),
+				"egressPriority": strconv.Itoa(egressPriority),
+				"from":           ipWithMask.String(),
+				"table":          strconv.Itoa(tableID),
+			}).Info("Configuring ip rule for cidr")
 			if err := route.ReplaceRule(route.Rule{
 				Priority: egressPriority,
 				From:     &ipWithMask,
@@ -106,6 +115,12 @@ func (info *RoutingInfo) Configure(ip net.IP, mtu int, compat bool, host bool) e
 			}
 		}
 	} else {
+		log.WithFields(logrus.Fields{
+			"endpointIP":     ip,
+			"egressPriority": strconv.Itoa(egressPriority),
+			"from":           ipWithMask.String(),
+			"table":          strconv.Itoa(tableID),
+		}).Info("Configuring ip rule")
 		// Lookup a VPC specific table for all traffic from an endpoint.
 		if err := route.ReplaceRule(route.Rule{
 			Priority: egressPriority,

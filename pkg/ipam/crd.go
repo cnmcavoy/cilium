@@ -78,6 +78,10 @@ type nodeStore struct {
 	conf      *option.DaemonConfig
 	mtuConfig MtuConfiguration
 	sysctl    sysctl.Sysctl
+
+	// reconciler is an optional interface to reconcile endpoint routing
+	// when VPC CIDRs change
+	reconciler EndpointRoutingReconciler
 }
 
 // newNodeStore initializes a new store which reflects the CiliumNode custom
@@ -257,6 +261,41 @@ func deriveVpcCIDRs(node *ciliumv2.CiliumNode) (primaryCIDR *cidr.CIDR, secondar
 	return
 }
 
+// cidrsEqual compares two slices of CIDRs and returns true if they contain the same CIDRs.
+func cidrsEqual(a, b []*cidr.CIDR) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	// Convert to string slices for easier comparison
+	aStrings := make([]string, len(a))
+	bStrings := make([]string, len(b))
+	for i, c := range a {
+		if c != nil {
+			aStrings[i] = c.String()
+		}
+	}
+	for i, c := range b {
+		if c != nil {
+			bStrings[i] = c.String()
+		}
+	}
+	// Sort and compare
+	slices.Sort(aStrings)
+	slices.Sort(bStrings)
+	return slices.Equal(aStrings, bStrings)
+}
+
+// cidrsToStrings converts a slice of CIDRs to a slice of strings.
+func cidrsToStrings(cidrs []*cidr.CIDR) []string {
+	result := make([]string, 0, len(cidrs))
+	for _, c := range cidrs {
+		if c != nil {
+			result = append(result, c.String())
+		}
+	}
+	return result
+}
+
 func (n *nodeStore) autoDetectIPv4NativeRoutingCIDR(localNodeStore *node.LocalNodeStore) bool {
 	if primaryCIDR, secondaryCIDRs := deriveVpcCIDRs(n.ownNode); primaryCIDR != nil {
 		allCIDRs := append([]*cidr.CIDR{primaryCIDR}, secondaryCIDRs...)
@@ -404,6 +443,34 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 		if err := configureENIDevices(n.ownNode, node, n.mtuConfig, n.sysctl); err != nil {
 			log.WithError(err).Errorf("Failed to update routes and rules for ENIs")
 		}
+
+		// Check if VPC CIDRs have changed and trigger endpoint routing reconciliation
+		if n.ownNode != nil && n.reconciler != nil {
+			oldPrimaryCIDR, oldSecondaryCIDRs := deriveVpcCIDRs(n.ownNode)
+			newPrimaryCIDR, newSecondaryCIDRs := deriveVpcCIDRs(node)
+
+			// Check if CIDRs have changed
+			oldPrimaryCIDRStr := ""
+			if oldPrimaryCIDR != nil {
+				oldPrimaryCIDRStr = oldPrimaryCIDR.String()
+			}
+			newPrimaryCIDRStr := ""
+			if newPrimaryCIDR != nil {
+				newPrimaryCIDRStr = newPrimaryCIDR.String()
+			}
+
+			if oldPrimaryCIDRStr != newPrimaryCIDRStr || !cidrsEqual(oldSecondaryCIDRs, newSecondaryCIDRs) {
+				log.WithFields(logrus.Fields{
+					"old-primary":   oldPrimaryCIDRStr,
+					"new-primary":   newPrimaryCIDRStr,
+					"old-secondary": cidrsToStrings(oldSecondaryCIDRs),
+					"new-secondary": cidrsToStrings(newSecondaryCIDRs),
+				}).Info("VPC CIDRs changed, triggering endpoint routing reconciliation")
+
+				// Trigger reconciliation asynchronously to avoid holding the lock
+				go n.reconciler.ReconcileEndpointRouting(newPrimaryCIDRStr, cidrsToStrings(newSecondaryCIDRs))
+			}
+		}
 	}
 
 	n.ownNode = node
@@ -514,6 +581,14 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 func (n *nodeStore) setOwnNodeWithoutPoolUpdate(node *ciliumv2.CiliumNode) {
 	n.mutex.Lock()
 	n.ownNode = node
+	n.mutex.Unlock()
+}
+
+// setEndpointRoutingReconciler sets the reconciler interface that will be called
+// when VPC CIDRs change to update endpoint routing rules.
+func (n *nodeStore) setEndpointRoutingReconciler(reconciler EndpointRoutingReconciler) {
+	n.mutex.Lock()
+	n.reconciler = reconciler
 	n.mutex.Unlock()
 }
 
@@ -719,6 +794,15 @@ func newCRDAllocator(
 	sharedNodeStore.addAllocator(allocator)
 
 	return allocator
+}
+
+// SetEndpointRoutingReconciler sets the reconciler for endpoint routing on the
+// shared node store. This should be called after IPAM is configured to enable
+// automatic reconciliation of endpoint routing rules when VPC CIDRs change.
+func SetEndpointRoutingReconciler(reconciler EndpointRoutingReconciler) {
+	if sharedNodeStore != nil {
+		sharedNodeStore.setEndpointRoutingReconciler(reconciler)
+	}
 }
 
 // deriveGatewayIP accept the CIDR and the index of the IP in this CIDR.

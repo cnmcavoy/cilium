@@ -17,6 +17,7 @@ import (
 	linuxrouting "github.com/cilium/cilium/pkg/datapath/linux/routing"
 	"github.com/cilium/cilium/pkg/datapath/tables"
 	"github.com/cilium/cilium/pkg/datapath/types"
+	"github.com/cilium/cilium/pkg/endpoint"
 	iputil "github.com/cilium/cilium/pkg/ip"
 	"github.com/cilium/cilium/pkg/ipam"
 	ipamOption "github.com/cilium/cilium/pkg/ipam/option"
@@ -586,6 +587,14 @@ func (d *Daemon) startIPAM() {
 	log.Info("Initializing node addressing")
 	// Set up ipam conf after init() because we might be running d.conf.KVStoreIPv4Registration
 	d.ipam.ConfigureAllocator()
+
+	// Set up endpoint routing reconciler for ENI mode
+	// This enables automatic reconciliation of endpoint routing rules when VPC CIDRs change
+	if option.Config.IPAM == ipamOption.IPAMENI {
+		ipam.SetEndpointRoutingReconciler(d)
+		log.Info("Endpoint routing reconciler enabled for ENI mode")
+	}
+
 	bootstrapStats.ipam.End(true)
 }
 
@@ -599,3 +608,111 @@ func parseRoutingInfo(result *ipam.AllocationResult) (*linuxrouting.RoutingInfo,
 		option.Config.EnableIPv4Masquerade,
 	)
 }
+
+// ReconcileEndpointRouting implements the ipam.EndpointRoutingReconciler interface.
+// It is called when VPC CIDRs change to update routing rules for all existing endpoints.
+func (d *Daemon) ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []string) {
+	log.WithFields(map[string]interface{}{
+		"primaryCIDR":    primaryCIDR,
+		"secondaryCIDRs": secondaryCIDRs,
+	}).Info("Reconciling endpoint routing rules for all endpoints with updated VPC CIDRs")
+
+	// Get all endpoints
+	endpoints := d.endpointManager.GetEndpoints()
+	successCount := 0
+	failCount := 0
+
+	// Build the full CIDR list
+	allCIDRs := []string{}
+	if primaryCIDR != "" {
+		allCIDRs = append(allCIDRs, primaryCIDR)
+	}
+	allCIDRs = append(allCIDRs, secondaryCIDRs...)
+
+	for _, ep := range endpoints {
+		if err := d.reconcileEndpointRoutingRules(ep, allCIDRs); err != nil {
+			log.WithError(err).WithField("endpoint", ep.StringID()).Warn("Failed to reconcile routing rules for endpoint")
+			failCount++
+		} else {
+			successCount++
+		}
+	}
+
+	log.WithFields(map[string]interface{}{
+		"success": successCount,
+		"failed":  failCount,
+		"total":   len(endpoints),
+	}).Info("Endpoint routing reconciliation completed")
+}
+
+// reconcileEndpointRoutingRules updates the routing rules for a single endpoint
+func (d *Daemon) reconcileEndpointRoutingRules(ep *endpoint.Endpoint, newCIDRs []string) error {
+	// Get endpoint's IPv4 address
+	ipv4 := ep.IPv4Address()
+	if !ipv4.IsValid() || ipv4.IsUnspecified() {
+		// No IPv4 address, nothing to reconcile
+		return nil
+	}
+
+	log.WithFields(map[string]interface{}{
+		"endpoint": ep.StringID(),
+		"ipv4":     ipv4.String(),
+		"cidrs":    newCIDRs,
+	}).Debug("Reconciling routing rules for endpoint")
+
+	// Try to get the existing IPAM allocation for this endpoint
+	// by allocating the same IP again (which should return the existing allocation)
+	alloc, err := d.ipam.IPv4Allocator.Allocate(ipv4.AsSlice(), ep.StringID(), ipam.PoolDefault())
+	if err != nil {
+		// If allocation fails, it might mean the IP is not allocated in IPAM
+		// This can happen during endpoint transition states, so we log and skip
+		log.WithError(err).WithFields(map[string]interface{}{
+			"endpoint": ep.StringID(),
+			"ipv4":     ipv4.String(),
+		}).Debug("Unable to get IPAM allocation for endpoint, skipping reconciliation")
+		return nil
+	}
+
+	// Update the CIDRs in the allocation
+	alloc.CIDRs = newCIDRs
+
+	// Create new routing info with updated CIDRs
+	routingInfo, err := linuxrouting.NewRoutingInfo(
+		alloc.GatewayIP,
+		alloc.CIDRs,
+		alloc.PrimaryMAC,
+		alloc.InterfaceNumber,
+		option.Config.IPAM,
+		option.Config.EnableIPv4Masquerade,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to create routing info: %w", err)
+	}
+
+	// Delete old routing rules using the package-level Delete function
+	if err := linuxrouting.Delete(
+		ipv4,
+		option.Config.EgressMultiHomeIPRuleCompat,
+	); err != nil {
+		log.WithError(err).WithField("endpoint", ep.StringID()).Warn("Failed to delete old routing rules, continuing with configuration")
+		// Continue anyway to try to set up new rules
+	}
+
+	// Configure new routing rules with updated CIDRs
+	if err := routingInfo.Configure(
+		ipv4.AsSlice(),
+		d.mtuConfig.GetDeviceMTU(),
+		option.Config.EgressMultiHomeIPRuleCompat,
+		false,
+	); err != nil {
+		return fmt.Errorf("failed to configure new routing rules: %w", err)
+	}
+
+	log.WithFields(map[string]interface{}{
+		"endpoint": ep.StringID(),
+		"ipv4":     ipv4.String(),
+	}).Debug("Successfully reconciled routing rules for endpoint")
+
+	return nil
+}
+

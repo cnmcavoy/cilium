@@ -46,6 +46,14 @@ type Owner interface {
 	UpdateCiliumNodeResource()
 }
 
+// EndpointRoutingReconciler is an optional interface that the IPAM owner can
+// implement to reconcile endpoint routing rules when VPC CIDRs change.
+type EndpointRoutingReconciler interface {
+	// ReconcileEndpointRouting is called when VPC CIDRs change to update
+	// routing rules for all existing endpoints.
+	ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []string)
+}
+
 // K8sEventRegister is used to register and handle events as they are processed
 // by K8s controllers.
 type K8sEventRegister interface {
