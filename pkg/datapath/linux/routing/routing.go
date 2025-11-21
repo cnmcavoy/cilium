@@ -287,7 +287,11 @@ func Delete(ip netip.Addr, compat bool) error {
 				To:       normalizeRuleToCIDR(cidr),
 			}
 			if err := deleteRule(egress); err != nil {
-				return fmt.Errorf("unable to delete egress rule with ip %s: %w", ipWithMask.String(), err)
+				log.WithFields(logrus.Fields{
+					"endpointIP": ip,
+				}).Warning(fmt.Sprintf("unable to delete %s egress rule with ip %s: %w", cidr.String(), ipWithMask.String(), err))
+				//return fmt.Errorf("unable to delete %s egress rule with ip %s: %w", cidr.String(), ipWithMask.String(), err)
+				continue
 			}
 			scopedLog.WithField(logfields.Rule, egress).Debug("Deleted egress rule")
 		}

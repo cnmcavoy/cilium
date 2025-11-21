@@ -611,10 +611,12 @@ func parseRoutingInfo(result *ipam.AllocationResult) (*linuxrouting.RoutingInfo,
 
 // ReconcileEndpointRouting implements the ipam.EndpointRoutingReconciler interface.
 // It is called when VPC CIDRs change to update routing rules for all existing endpoints.
-func (d *Daemon) ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []string) {
+func (d *Daemon) ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []string, oldPrimaryCIDR string, oldSecondaryCIDRs []string) {
 	log.WithFields(map[string]interface{}{
-		"primaryCIDR":    primaryCIDR,
-		"secondaryCIDRs": secondaryCIDRs,
+		"primaryCIDR":       primaryCIDR,
+		"secondaryCIDRs":    secondaryCIDRs,
+		"oldPrimaryCIDR":    oldPrimaryCIDR,
+		"oldSecondaryCIDRs": oldSecondaryCIDRs,
 	}).Info("Reconciling endpoint routing rules for all endpoints with updated VPC CIDRs")
 
 	// Get all endpoints
@@ -623,14 +625,11 @@ func (d *Daemon) ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []s
 	failCount := 0
 
 	// Build the full CIDR list
-	allCIDRs := []string{}
-	if primaryCIDR != "" {
-		allCIDRs = append(allCIDRs, primaryCIDR)
-	}
-	allCIDRs = append(allCIDRs, secondaryCIDRs...)
+	allCIDRs := append(append([]string{}, primaryCIDR), secondaryCIDRs...)
+	oldCIDRS := append(append([]string{}, oldPrimaryCIDR), oldSecondaryCIDRs...)
 
 	for _, ep := range endpoints {
-		if err := d.reconcileEndpointRoutingRules(ep, allCIDRs); err != nil {
+		if err := d.reconcileEndpointRoutingRules(ep, allCIDRs, oldCIDRS); err != nil {
 			log.WithError(err).WithField("endpoint", ep.StringID()).Warn("Failed to reconcile routing rules for endpoint")
 			failCount++
 		} else {
@@ -646,7 +645,7 @@ func (d *Daemon) ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []s
 }
 
 // reconcileEndpointRoutingRules updates the routing rules for a single endpoint
-func (d *Daemon) reconcileEndpointRoutingRules(ep *endpoint.Endpoint, newCIDRs []string) error {
+func (d *Daemon) reconcileEndpointRoutingRules(ep *endpoint.Endpoint, newCIDRs, oldCIDRs []string) error {
 	// Get endpoint's IPv4 address
 	ipv4 := ep.IPv4Address()
 	if !ipv4.IsValid() || ipv4.IsUnspecified() {
@@ -654,26 +653,45 @@ func (d *Daemon) reconcileEndpointRoutingRules(ep *endpoint.Endpoint, newCIDRs [
 		return nil
 	}
 
-	log.WithFields(map[string]interface{}{
-		"endpoint": ep.StringID(),
-		"ipv4":     ipv4.String(),
-		"cidrs":    newCIDRs,
-	}).Debug("Reconciling routing rules for endpoint")
-
-	// Try to get the existing IPAM allocation for this endpoint
-	// by allocating the same IP again (which should return the existing allocation)
-	alloc, err := d.ipam.IPv4Allocator.Allocate(ipv4.AsSlice(), ep.StringID(), ipam.PoolDefault())
+	// Get the existing allocation result for this endpoint's IP
+	// We need this to get the gateway IP, MAC address, and interface number
+	// which are required to configure routing rules
+	alloc, err := d.getIPAllocationInfo(ipv4.AsSlice())
 	if err != nil {
-		// If allocation fails, it might mean the IP is not allocated in IPAM
-		// This can happen during endpoint transition states, so we log and skip
+		// If we can't get allocation info, skip this endpoint
+		// This can happen if the IP is in a transition state
 		log.WithError(err).WithFields(map[string]interface{}{
 			"endpoint": ep.StringID(),
 			"ipv4":     ipv4.String(),
-		}).Debug("Unable to get IPAM allocation for endpoint, skipping reconciliation")
+		}).Debug("Unable to get IP allocation info for endpoint, skipping reconciliation")
 		return nil
 	}
 
-	// Update the CIDRs in the allocation
+	log.WithFields(map[string]interface{}{
+		"endpoint":  ep.StringID(),
+		"ipv4":      ipv4.String(),
+		"cidrs":     newCIDRs,
+		"old_cidrs": oldCIDRs,
+	}).Debug("Reconciling routing rules for endpoint")
+
+	// Delete old routing rules using old cidrs
+	oldRoutingInfo, err := linuxrouting.NewRoutingInfo(
+		alloc.GatewayIP,
+		oldCIDRs,
+		alloc.PrimaryMAC,
+		alloc.InterfaceNumber,
+		option.Config.IPAM,
+		option.Config.EnableIPv4Masquerade,
+	)
+	node.SetRouterInfo(oldRoutingInfo)
+	if err := linuxrouting.Delete(
+		ipv4,
+		option.Config.EgressMultiHomeIPRuleCompat,
+	); err != nil {
+		log.WithError(err).WithField("endpoint", ep.StringID()).Warn("Failed to delete old routing rules, continuing with configuration")
+		// Continue anyway to try to set up new rules
+	}
+	// Update the CIDRs in the allocation to the new filtered set
 	alloc.CIDRs = newCIDRs
 
 	// Create new routing info with updated CIDRs
@@ -685,17 +703,10 @@ func (d *Daemon) reconcileEndpointRoutingRules(ep *endpoint.Endpoint, newCIDRs [
 		option.Config.IPAM,
 		option.Config.EnableIPv4Masquerade,
 	)
+	node.SetRouterInfo(routingInfo)
+
 	if err != nil {
 		return fmt.Errorf("failed to create routing info: %w", err)
-	}
-
-	// Delete old routing rules using the package-level Delete function
-	if err := linuxrouting.Delete(
-		ipv4,
-		option.Config.EgressMultiHomeIPRuleCompat,
-	); err != nil {
-		log.WithError(err).WithField("endpoint", ep.StringID()).Warn("Failed to delete old routing rules, continuing with configuration")
-		// Continue anyway to try to set up new rules
 	}
 
 	// Configure new routing rules with updated CIDRs
@@ -716,3 +727,18 @@ func (d *Daemon) reconcileEndpointRoutingRules(ep *endpoint.Endpoint, newCIDRs [
 	return nil
 }
 
+// getIPAllocationInfo retrieves the allocation information for an already-allocated IP
+// without trying to allocate it again. This is used during reconciliation to get
+// gateway IP, MAC address, and interface information needed for routing rules.
+func (d *Daemon) getIPAllocationInfo(ip net.IP) (*ipam.AllocationResult, error) {
+	// For CRD-based IPAM (ENI, Azure, AlibabaCloud), we can reconstruct the
+	// allocation result by looking up the IP in the CiliumNode resource
+	if d.ipam.IPv4Allocator == nil {
+		return nil, fmt.Errorf("IPv4 allocator not available")
+	}
+
+	// Access the internal allocator to get ipInfo
+	// We need to use reflection or provide a new method in IPAM
+	// For now, let's add a new method to IPAM: GetAllocationInfo
+	return d.ipam.GetAllocationInfo(ip)
+}

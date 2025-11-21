@@ -468,7 +468,7 @@ func (n *nodeStore) updateLocalNodeResource(node *ciliumv2.CiliumNode) {
 				}).Info("VPC CIDRs changed, triggering endpoint routing reconciliation")
 
 				// Trigger reconciliation asynchronously to avoid holding the lock
-				go n.reconciler.ReconcileEndpointRouting(newPrimaryCIDRStr, cidrsToStrings(newSecondaryCIDRs))
+				go n.reconciler.ReconcileEndpointRouting(newPrimaryCIDRStr, cidrsToStrings(newSecondaryCIDRs), oldPrimaryCIDRStr, cidrsToStrings(oldSecondaryCIDRs))
 			}
 		}
 	}

@@ -4,6 +4,7 @@
 package ipam
 
 import (
+	"fmt"
 	"net"
 
 	"github.com/sirupsen/logrus"
@@ -51,7 +52,7 @@ type Owner interface {
 type EndpointRoutingReconciler interface {
 	// ReconcileEndpointRouting is called when VPC CIDRs change to update
 	// routing rules for all existing endpoints.
-	ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []string)
+	ReconcileEndpointRouting(primaryCIDR string, secondaryCIDRs []string, oldPrimaryCIDR string, oldSecondaryCIDRs []string)
 }
 
 // K8sEventRegister is used to register and handle events as they are processed
@@ -213,4 +214,38 @@ func PoolOrDefault(pool string) Pool {
 // PoolDefault returns the default pool
 func PoolDefault() Pool {
 	return Pool(option.Config.IPAMDefaultIPPool)
+}
+
+// GetAllocationInfo retrieves allocation information for an already-allocated IP.
+// This is used during routing rule reconciliation to get gateway IP, MAC, and interface info
+// without trying to allocate the IP again (which would fail with "IP already in use").
+func (ipam *IPAM) GetAllocationInfo(ip net.IP) (*AllocationResult, error) {
+	if ipam.IPv4Allocator == nil {
+		return nil, fmt.Errorf("IPv4 allocator not available")
+	}
+
+	// Try to get the CRD allocator
+	crdAlloc, ok := ipam.IPv4Allocator.(*crdAllocator)
+	if !ok {
+		return nil, fmt.Errorf("allocation info lookup not supported for this IPAM mode")
+	}
+
+	// Lock the allocator to safely access internal state
+	crdAlloc.mutex.RLock()
+	defer crdAlloc.mutex.RUnlock()
+
+	// Check if the IP is allocated
+	ipStr := ip.String()
+	ipInfo, ok := crdAlloc.allocated[ipStr]
+	if !ok {
+		return nil, fmt.Errorf("IP %s is not allocated", ipStr)
+	}
+
+	// Build the allocation result from the stored ipInfo
+	result, err := crdAlloc.buildAllocationResult(ip, &ipInfo)
+	if err != nil {
+		return nil, fmt.Errorf("failed to build allocation result for %s: %w", ipStr, err)
+	}
+
+	return result, nil
 }
