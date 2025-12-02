@@ -166,6 +166,7 @@ status:
   conditions:
   - lastProbeTime: null
     type: Ready
+    status: "True"
 
 -- pod-single.yaml --
 apiVersion: v1
@@ -194,3 +195,4 @@ status:
   conditions:
   - lastProbeTime: null
     type: Ready
+    status: "True"
