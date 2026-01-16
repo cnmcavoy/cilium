@@ -1,30 +1,27 @@
-# Regression test for https://github.com/cilium/cilium/issues/41450 where
-# a service was incorrectly redirected to a LRP service without backends when
-# no matching local target pods existed.
+# Tests that pod with non-ready status are not added as LRP backends.
 
 hive/start
 
-# Add services and endpoints.
-k8s/add service.yaml endpointslice.yaml
-db/cmp services services-before.table
-db/cmp frontends frontends-before.table
+# Add LRP, service and pods.
+k8s/add service.yaml lrp-svc.yaml lrp-addr.yaml pod-before.yaml
+# Give some time for reconciliation loop to run
+sleep 500ms
 
-# Add the redirects. The existing frontends should not be affected
-# by this since no local pods exist.
-k8s/add lrp-svc.yaml lrp-addr.yaml
+# No local-redirect frontends with associated backends as pods are not "ready".
 db/cmp localredirectpolicies lrp.table
 db/cmp services services.table
 db/cmp frontends frontends-before.table
 
-# Add a pod. The frontends should now be redirected.
-k8s/add pod.yaml
+# Update the pod status. The frontends should now be redirected.
+cp pod-before.yaml pod-ready.yaml
+sed 'status: "False"' 'status: "True"' pod-ready.yaml
+k8s/add pod-ready.yaml
 db/cmp frontends frontends.table
 
-# Removing the pod will remove the redirections and revert
-# back to the earlier state.
-k8s/delete pod.yaml
+# Toggle the pod status back to not being ready.
+k8s/add pod-before.yaml
 db/cmp frontends frontends-before.table
- 
+
 # -----
 
 -- lrp-svc.yaml --
@@ -68,7 +65,7 @@ spec:
       - port: "80"
         protocol: TCP
 
--- pod.yaml --
+-- pod-before.yaml --
 apiVersion: v1
 kind: Pod
 metadata:
@@ -90,12 +87,18 @@ status:
   hostIPs:
   - ip: 172.19.0.3
   phase: Running
+  conditions:
+  - lastProbeTime: null
+    lastTransitionTime: "2024-11-21T14:52:24Z"
+    status: "False"
+    type: Ready
   podIP: 10.244.2.1
   podIPs:
   - ip: 10.244.2.1
   - ip: 2001::1
   qosClass: BestEffort
   startTime: "2024-07-10T16:20:42Z"
+
 
 -- service.yaml --
 apiVersion: v1
@@ -107,7 +110,6 @@ spec:
   clusterIP: 1.1.1.1
   clusterIPs:
   - 1.1.1.1
-  - 1001::1
   externalTrafficPolicy: Cluster
   internalTrafficPolicy: Cluster
   ipFamilies:
@@ -124,50 +126,22 @@ spec:
   sessionAffinity: None
   type: ClusterIP
 
--- endpointslice.yaml --
-apiVersion: discovery.k8s.io/v1
-kind: EndpointSlice
-metadata:
-  labels:
-    kubernetes.io/service-name: echo
-  name: echo-kvlm2
-  namespace: test
-addressType: IPv4
-endpoints:
-- addresses:
-  - 10.244.1.1
-  conditions:
-    ready: true
-    serving: true
-    terminating: false
-  nodeName: nodeport-worker
-ports:
-- name: tcp
-  port: 8080
-  protocol: TCP
-
 -- lrp.table --
 Name           Type     FrontendType                Frontends
 test/lrp-addr  address  addr-single-port            169.254.169.254:8080/TCP
 test/lrp-svc   service  all
 
--- services-before.table --
-Name                          Source
-test/echo                     k8s   
-
 -- services.table --
 Name                          Source
 test/echo                     k8s
 test/lrp-addr:local-redirect  k8s
-test/lrp-svc:local-redirect   k8s   
+test/lrp-svc:local-redirect   k8s
 
 -- frontends-before.table --
-Address                    Type        ServiceName   PortName   Backends              Redirect                    Status
-1.1.1.1:8080/TCP           ClusterIP   test/echo     tcp        10.244.1.1:8080/TCP                               Done
-[1001::1]:8080/TCP         ClusterIP   test/echo     tcp                                                          Done
+Address                    Type          ServiceName                PortName   Backends              Redirect                    Status
+1.1.1.1:8080/TCP           ClusterIP     test/echo                  tcp                                                          Done
 
 -- frontends.table --
 Address                  Type          ServiceName                  PortName   Backends              Redirect                    Status
 1.1.1.1:8080/TCP         ClusterIP     test/echo                    tcp        10.244.2.1:80/TCP     test/lrp-svc:local-redirect Done
 169.254.169.254:8080/TCP LocalRedirect test/lrp-addr:local-redirect            10.244.2.1:80/TCP                                 Done
-[1001::1]:8080/TCP       ClusterIP     test/echo                    tcp        [2001::1]:80/TCP      test/lrp-svc:local-redirect Done

@@ -758,7 +758,9 @@ var localRedirectTestCases = []testCase{
 		func(svc *loadbalancer.Service, fe *loadbalancer.Frontend) (delete bool, bes []loadbalancer.Backend) {
 			fe.Type = ClusterIP
 			svcName := loadbalancer.NewServiceName("bar", "foo")
-			fe.RedirectTo = &svcName
+			fe.Redirect = &loadbalancer.RedirectParams{
+				ServiceName: &svcName,
+			}
 			fe.Address = autoAddr
 			return false, []loadbalancer.Backend{}
 		},

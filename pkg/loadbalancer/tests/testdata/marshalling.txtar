@@ -121,7 +121,7 @@ Address              Instances
     }
   ],
   "ID": 1,
-  "RedirectTo": null
+  "Redirect": null
 }
 {
   "Address": "[2001::1]:80/TCP",
@@ -169,7 +169,7 @@ Address              Instances
     }
   ],
   "ID": 2,
-  "RedirectTo": null
+  "Redirect": null
 }
 -- backends-expected.json --
 {
@@ -283,7 +283,7 @@ healthcheckbackends:
       unhealthy: false
       unhealthyupdatedat: 0001-01-01T00:00:00Z
 id: 1
-redirectto: null
+redirect: null
 ---
 frontendparams:
     address: '[2001::1]:80/TCP'
@@ -322,7 +322,7 @@ healthcheckbackends:
       unhealthy: false
       unhealthyupdatedat: 0001-01-01T00:00:00Z
 id: 2
-redirectto: null
+redirect: null
 -- backends-expected.yaml --
 address: 10.244.1.1:8080/TCP
 instances:
